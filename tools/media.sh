@@ -1,13 +1,13 @@
 #!/bin/bash
 # Make the README screenshots and demo reel (docs/media/) on the emulator with the real camera. Run in the lumix container:
-#   bash mobile/tools/media.sh [step...]      steps: setup shots notify reel encode cleanup (default: all, in that order)
+#   bash tools/media.sh [step...]      steps: setup shots notify reel encode cleanup (default: all, in that order)
 # Before: emulator running (`phone.sh emulator` done once), camera on its Wi-Fi waiting screen with sleep mode off, and for
 # live view the redirect + udprelay.py on the host (TESTING.md, "Live view on the emulator"). Takes ~5 min.
 # Saves the 2 newest photos on the emulator a few times for the notification shots and deletes them again in `cleanup`.
-# Raw captures: mobile/tools/out/raw/ (scratch). Steps and timings explained in TESTING.md, "README screenshots and demo reel".
+# Raw captures: tools/out/raw/ (scratch). Steps and timings explained in TESTING.md, "README screenshots and demo reel".
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
-ROOT=$(cd "$HERE/../.." && pwd)
+ROOT=$(cd "$HERE/.." && pwd)
 RAW="$HERE/out/raw"
 MEDIA=${MEDIA:-$ROOT/docs/media}
 DEV=192.168.65.254:5555

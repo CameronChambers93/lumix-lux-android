@@ -1,10 +1,10 @@
 #!/bin/sh
 # Drive the Lumix app on Cameron's phone over wireless ADB. Run inside the lumix container:
-#   sh mobile/tools/phone.sh <command>
+#   sh tools/phone.sh <command>
 # Always give explicit ip:port (mDNS doesn't work through Docker NAT).
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
-APK="$HERE/../../dist/lumix.apk"
+APK="$HERE/../dist/lumix.apk"
 DEVFILE="$HERE/.device"
 # PHONE_TARGET=emulator drives the Windows-host emulator instead of the phone (separate remembered target).
 [ "${PHONE_TARGET:-}" = emulator ] && DEVFILE="$HERE/.device-emulator"
@@ -18,10 +18,10 @@ usage: phone.sh <command>
   pair <ip:port> <code>   one-time pairing (port/code from Wireless debugging > Pair with code)
   connect <ip:port>       connect (port from the main Wireless debugging screen); remembered
   emulator                connect to the host emulator (lumix_s23plus or lumix_pixel5, start it on Windows first); then use
-                          PHONE_TARGET=emulator sh mobile/tools/phone.sh <command> for everything else
+                          PHONE_TARGET=emulator sh tools/phone.sh <command> for everything else
   status                  device, installed versionCode, whether the app is running
   install | launch | stop install dist/lumix.apk (-r, never uninstall) / start / force-stop
-  shot [file]             screenshot to mobile/tools/out/shot-<time>.png; prints the path
+  shot [file]             screenshot to tools/out/shot-<time>.png; prints the path
   logs [n]                last n (default 100) log lines for the app (+ Capacitor, chromium, AndroidRuntime)
   devtools                forward WebView DevTools to localhost:9222 and list targets
   eval '<js>'             run JS in the app page, print the result (exit 1 on exception)

@@ -9,10 +9,7 @@ ENV PATH=/home/vscode/.local/bin:$PATH \
     CLAUDE_CONFIG_DIR=/home/vscode/.claude
 
 # --- Project setup below (paths are relative to the project root).
-# The web app (app/server.py) is standard-library Python; nothing to install.
-EXPOSE 8420
-
-# --- Android app toolchain (mobile/, Capacitor 8): Node 22, JDK 21, Android SDK 36.
+# --- Android app toolchain (Capacitor 8): Node 22, JDK 21, Android SDK 36.
 # The base image's Yarn apt repo has an expired key and breaks apt-get update.
 RUN rm -f /etc/apt/sources.list.d/yarn.list \
  && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \

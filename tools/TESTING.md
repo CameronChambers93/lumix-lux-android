@@ -1,6 +1,6 @@
 # Phone test checklist
 
-Run from the lumix container: `P="sh mobile/tools/phone.sh"`. Setup is in `CLAUDE.md` ("Testing (emulator and phone)").
+Run from the lumix container: `P="sh tools/phone.sh"`. Setup is in `CLAUDE.md` ("Testing (emulator and phone)").
 Commands below assume the emulator (`PHONE_TARGET=emulator`); for the real phone drop it.
 The camera (10.0.0.220) only answers while it's on its Wi-Fi "waiting for connection" screen on home Wi-Fi.
 **Saving:** a few test saves on the emulator are fine (newest files, never the whole card). Ask Cameron before saving
@@ -24,9 +24,9 @@ Facts found on the host (2026-11-06; `lumix_s23plus` added 2026-11-08):
 - The container can't see host loopback directly. Docker Desktop publishes the host as `host.docker.internal`
   (`192.168.65.254`), and connections to it arrive on the host's loopback, so `adb connect 192.168.65.254:5555`
   from the container reaches the emulator's adb port. `phone.sh emulator` does exactly that and stores the target in
-  `mobile/tools/.device-emulator`. Accept the "Allow USB debugging?" prompt in the emulator the first time (if adb says
+  `tools/.device-emulator`. Accept the "Allow USB debugging?" prompt in the emulator the first time (if adb says
   "unauthorized": `adb keygen /root/.android/adbkey` in the container so the key is persistent, then "Always allow").
-- Use it: `docker exec -w /workspaces/lumix -e PHONE_TARGET=emulator dc-lumix sh mobile/tools/phone.sh <cmd>`
+- Use it: `docker exec -w /workspaces/lumix -e PHONE_TARGET=emulator dc-lumix sh tools/phone.sh <cmd>`
   (PowerShell), same commands as for the phone (`install`, `launch`, `shot`, `eval`, ...). Without
   `PHONE_TARGET=emulator` the script targets Cameron's phone. If adb lost the emulator, run `phone.sh emulator` again;
   `adb devices` should show `192.168.65.254:5555 device`. Bash tool on Windows: prefix `export MSYS_NO_PATHCONV=1;`.
@@ -122,7 +122,7 @@ its last client leaves (the app and the PC server send `playmode` when they see 
     set up the live view as below), `$P shot`. Hold W/T (`input swipe x y x y 1500`) zooms and sends `zoomstop`; tapping the picture sends `camctrl&type=touch&value=x/y&value2=on`;
     the shutter sends `camcmd&value=capture` (**uses a real shot: ask first**); Video + shutter = `video_recstart`/`video_recstop` with a timer. Close (X or Back) = `stopstream` + `playmode`:
     `camCmd("mode=getstate")` shows `<cammode>play`. The 5 s connection loop must not switch the camera to play while Remote is open (frames keep coming).
-23. **Fake camera (to avoid real shots or a real camera).** On the Windows host: `FAKE_PHOTO=photo.jpg FAKE_FRAMES=<dir of *.jpg> FAKE_CLOCK=compact python mobile/tools/fakecam.py 0.0.0.0 ok 80 x`
+23. **Fake camera (to avoid real shots or a real camera).** On the Windows host: `FAKE_PHOTO=photo.jpg FAKE_FRAMES=<dir of *.jpg> FAKE_CLOCK=compact python core/tools/fakecam.py 0.0.0.0 ok 80 x`
     (`photo.jpg` = any JPEG with EXIF, e.g. pulled from the emulator; it answers recmode/playmode/capture/zoom/touch/video/startstream, serves `/DO<n>.JPG?t=<local time>` with
     X-REC_DATE_TIME and rewritten EXIF dates, supports Range, `/_stats` lists the commands it saw; `busy` instead of `ok` answers 503). Point the app at it
     (`store.set("ip","10.0.0.129"); store.set("homeIp","10.0.0.129"); cam.online=false`) and save through the real queue:
@@ -132,19 +132,19 @@ its last client leaves (the app and the PC server send `playmode` when they see 
 ## Live view on the emulator
 The camera (or the fake) sends UDP to the host's LAN address, but the emulator only sees what its redirect forwards from host loopback. What worked:
 1. `adb -s emulator-5554 emu redir add udp:49199:49199` (host adb; `redir list` to check). Gone when the emulator restarts.
-2. Real camera: `python mobile/tools/udprelay.py 10.0.0.129` on the host copies datagrams from `<LAN ip>:49199` to `127.0.0.1:49199`
+2. Real camera: `python tools/udprelay.py 10.0.0.129` on the host copies datagrams from `<LAN ip>:49199` to `127.0.0.1:49199`
    (the LAN IP is where the emulator's NAT shows up as the requester; the camera replies to it). Stop the relay afterwards.
    Fake camera: `FAKE_UDP` defaults to 127.0.0.1, so no relay is needed.
 3. The app's socket is bound to the Wi-Fi network and receives the redirected packets. Measured ~11 fps displayed in the emulator (software rendering).
 A live view that stalls after startup: close and reopen Remote (re-sending `startstream`, with or without `stopstream`, did not revive it once).
 
 ## README screenshots and demo reel
-**Script:** `bash mobile/tools/media.sh` runs all of the steps below (~5 min), or some of them: `media.sh shots encode`
+**Script:** `bash tools/media.sh` runs all of the steps below (~5 min), or some of them: `media.sh shots encode`
 (steps `setup shots notify reel encode cleanup`; `MODES=dark` for one theme only, `MEDIA=<dir>` to encode elsewhere). Look at
-`mobile/tools/out/reel-sheet.png` and the JPEGs before committing. The steps explain what it does and why.
+`tools/out/reel-sheet.png` and the JPEGs before committing. The steps explain what it does and why.
 
 How `docs/media/` was made (2026-11-09, `lumix_s23plus`, real camera on home Wi-Fi). By hand it took ~20 min; the camera must stay on its
-Wi-Fi waiting screen the whole time (turn off its sleep mode). Raw captures go to `mobile/tools/out/raw/` (scratch).
+Wi-Fi waiting screen the whole time (turn off its sleep mode). Raw captures go to `tools/out/raw/` (scratch).
 `A` below is `adb -s 192.168.65.254:5555 shell`. In zsh, wrap commands in functions or a `bash` script: `A="adb ... shell"; $A ...` fails because zsh doesn't split words.
 
 1. **Setup.** Emulator running, `phone.sh emulator`, `install`, `launch`; live view redirect and `udprelay.py` on the host (section above).

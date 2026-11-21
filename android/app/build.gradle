@@ -16,7 +16,7 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
-    // Signed with a key kept in mobile/keystore/ (not in git) so new builds install over old ones.
+    // Signed with a key kept in keystore/ (not in git) so new builds install over old ones.
     def ksFile = rootProject.file('../keystore/keystore.properties')
     signingConfigs {
         release {
