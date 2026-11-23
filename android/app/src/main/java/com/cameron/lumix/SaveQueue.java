@@ -40,6 +40,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * The save queue: downloads camera files into MediaStore from a pool of worker threads. It lives in static state so it
  * outlives the activity; SaveService (a foreground service) keeps the process alive and shows the notification.
  * A file that fails mid-download keeps its pending MediaStore row and is resumed with a Range request next time.
+ * Everything camera-specific comes from the driver's save slice (core/js/lux-camera.js Camera.slice("save")).
  */
 final class SaveQueue {
     static final String TAG = "LumixSave";
@@ -54,6 +55,29 @@ final class SaveQueue {
         final long size, date;
         Job(String url, String name, String mime, long size, long date) {
             this.url = url; this.name = name; this.mime = mime; this.size = size; this.date = date;
+        }
+    }
+
+    /** The runtime's save slice: how to keep the camera session alive and in its media mode. URLs are guard-checked. */
+    static final class Driver {
+        final String keepaliveUrl, pairUrl, pairOkPrefix, okMatch, busy, modeUrl, modeTag, modeValue;
+        final int keepaliveMs, settleMs;
+        final boolean range;
+
+        Driver(JSONObject d) throws Exception {
+            JSONObject m = d.getJSONObject("mediaMode");
+            keepaliveUrl = d.getString("keepaliveUrl");
+            keepaliveMs = d.optInt("keepaliveMs", 5000);
+            pairUrl = d.getString("pairUrl");
+            pairOkPrefix = d.getString("pairOkPrefix");
+            okMatch = d.getString("okMatch");
+            busy = d.getString("busy");
+            modeUrl = m.getString("url");
+            modeTag = m.getString("modeTag");
+            modeValue = m.getString("value");
+            settleMs = m.optInt("settleMs", 2000);
+            range = d.optBoolean("range", false);
+            for (String u : new String[]{keepaliveUrl, pairUrl, modeUrl}) Guard.check(u);
         }
     }
 
@@ -77,7 +101,8 @@ final class SaveQueue {
     private static final List<String[]> failed = new ArrayList<>();
     private static final Set<String> pending = new HashSet<>();   // queued or in flight
     private static final Set<String> runNames = new HashSet<>();
-    private static String camIp, folder, appId;
+    private static String camIp, folder;
+    private static Driver drv;
     private static long okAt;
     private static Network boundTo;
     private static PowerManager.WakeLock wake;
@@ -121,7 +146,7 @@ final class SaveQueue {
     static boolean wasCancelled() { synchronized (L) { return cancelled; } }
     static String folder() { synchronized (L) { return folder == null ? "DCIM/Lumix/" : folder; } }
 
-    static void enqueue(Context ctx, List<Job> jobs, String ip, String fol, int par, String id) {
+    static void enqueue(Context ctx, List<Job> jobs, String ip, String fol, int par, Driver d) {
         boolean start = false;
         int workers = 1;
         synchronized (L) {
@@ -131,7 +156,7 @@ final class SaveQueue {
                 total = done = 0;
                 doneBytes = totalBytes = 0;
                 failed.clear(); queue.clear(); active.clear(); pending.clear(); runNames.clear();
-                camIp = ip; folder = fol; appId = id;
+                camIp = ip; folder = fol; drv = d;
                 running = true; start = true;
                 workers = Math.max(1, Math.min(3, par));
                 workersLeft = workers;
@@ -175,12 +200,12 @@ final class SaveQueue {
 
     private static boolean playChecked;
 
-    /** Once per run, before the first download: make sure the camera is in playback mode. */
+    /** Once per run, before the first download: make sure the camera is in its media (playback) mode. */
     private static void checkPlayMode() {
         synchronized (CAMLOCK) {
             if (playChecked) return;
             playChecked = true;
-            try { ensurePlay(readCam0("http://" + camIp + "/cam.cgi?mode=getstate", 3000)); } catch (Exception e) { Log.w(TAG, "mode check: " + e); }
+            try { ensurePlay(readCam0(drv.keepaliveUrl, 3000)); } catch (Exception e) { Log.w(TAG, "mode check: " + e); }
         }
     }
 
@@ -303,7 +328,7 @@ final class SaveQueue {
                 row = null; have = 0;
             }
         }
-        if (row != null && (have <= 0 || (j.size > 0 && have >= j.size))) have = 0;
+        if (row != null && (have <= 0 || (j.size > 0 && have >= j.size) || !drv.range)) have = 0;   // no Range: start over
         if (row == null) {
             Uri coll = j.mime.startsWith("video/")
                 ? MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
@@ -450,12 +475,12 @@ final class SaveQueue {
                 w = waiting;
             }
             try {
-                String body = readCam("http://" + camIp + "/cam.cgi?mode=getstate", 3000);
-                boolean ok = body.contains("<result>ok</result>");
+                String body = readCam(drv.keepaliveUrl, 3000);
+                boolean ok = body.contains(drv.okMatch);
                 if (ok) ensurePlay(body);
                 if (!ok) {
-                    String r = readCam("http://" + camIp + "/cam.cgi?mode=accctrl&type=req_acc&value=" + appId + "&value2=lumix-phone", 8000);
-                    ok = r.trim().startsWith("ok");
+                    String r = readCam(drv.pairUrl, 8000);
+                    ok = r.trim().startsWith(drv.pairOkPrefix) && !r.contains(drv.busy);
                     Log.i(TAG, "re-paired: " + r.trim());
                 }
                 synchronized (L) { camOk = ok; if (ok) okAt = SystemClock.uptimeMillis(); }
@@ -463,7 +488,7 @@ final class SaveQueue {
                 if (w) Log.i(TAG, "keepalive: " + e);
                 synchronized (L) { camOk = false; }
             }
-            try { Thread.sleep(w ? 1500 : 5000); } catch (InterruptedException e) { return; }
+            try { Thread.sleep(w ? 1500 : drv.keepaliveMs); } catch (InterruptedException e) { return; }
         }
     }
 
@@ -473,17 +498,19 @@ final class SaveQueue {
 
     /**
      * The camera is sometimes found in rec mode (it returns to its live view by itself after a client leaves) and media
-     * access should happen in playback mode. playmode is non-destructive: send it when getstate says anything but play.
-     * Returns the getstate body as it was before the switch.
+     * access should happen in its media mode. Switching is non-destructive: do it when the state names any other mode.
+     * Returns the state body as it was before the switch.
      */
     private static String ensurePlay(String body) {
-        if (body == null || !body.contains("<cammode>") || body.contains("<cammode>play</cammode>")) return body;
+        String open = "<" + drv.modeTag + ">";
+        int at = body == null ? -1 : body.indexOf(open);
+        if (at < 0 || body.startsWith(drv.modeValue + "</", at + open.length())) return body;
         try {
-            Log.i(TAG, "camera was in rec mode: sending playmode");
-            readCam("http://" + camIp + "/cam.cgi?mode=camcmd&value=playmode", 6000);
-            Thread.sleep(2000);
+            Log.i(TAG, "camera was in " + body.substring(at + open.length(), Math.max(at + open.length(), body.indexOf('<', at + open.length()))) + " mode: switching to " + drv.modeValue);
+            readCam(drv.modeUrl, 6000);
+            Thread.sleep(drv.settleMs);
         } catch (Exception e) {
-            Log.w(TAG, "playmode: " + e);
+            Log.w(TAG, "media mode: " + e);
         }
         return body;
     }
@@ -502,6 +529,7 @@ final class SaveQueue {
     }
 
     private static HttpURLConnection openCam(String url, int timeout) throws IOException {
+        Guard.check(url);
         ConnectivityManager cm = (ConnectivityManager) app.getSystemService(Context.CONNECTIVITY_SERVICE);
         Network net = LumixNativePlugin.wifiNetwork(cm);   // the camera's own Wi-Fi if joined, else the first Wi-Fi
         if (net != null && !net.equals(boundTo)) {   // Wi-Fi came back as a new network: follow it

@@ -44,7 +44,7 @@ What can't be tested there:
   battery managers. Those need the real phone.
 - `bindProcessToNetwork` on a no-internet Wi-Fi: the emulator's simulated Wi-Fi has internet.
 
-## Checklist (v2.0)
+## Checklist (v3.0)
 
 `$P eval` runs JS in the app page (globals `cam`, `sync`, `catalog`, `items`, `Native`, ...). Camera rules: one client at a time
 (stop the app and the PC page before curl probes, then wait ~20 s); the camera drops back to `rec` mode by itself some seconds after
@@ -59,7 +59,7 @@ its last client leaves (the app and the PC server send `playmode` when they see 
    `$P eval 'JSON.stringify(cam)'` -> `online: true`, `ip: "10.0.0.220"`, empty `error`.
 3. **Camera back in playback mode.** With the app stopped for ~30 s, `curl "http://10.0.0.220/cam.cgi?mode=getstate"` shows `<cammode>rec`.
    Launch the app: within ~15 s it shows `<cammode>play`. While the app runs, `curl ...mode=camcmd&value=recmode` is undone by the 5 s loop; during
-   a save the log says `LumixSave: camera was in rec mode: sending playmode`; the PC server logs the same in `/tmp/lumix.log`. Nothing is
+   a save the log says `LumixSave: camera was in rec mode: switching to play`; the PC server logs the same in `/tmp/lumix.log`. Nothing is
    switched while the Remote screen is open.
 4. **No errors.** `$P logs 400 | grep "FATAL EXCEPTION"` shows nothing for `com.cameron.lumix` (Android's own Settings once crashed on a withdrawn
    Wi-Fi request: not ours); `$P console 5` shows only Capacitor's "Error injecting safe area CSS" lines (harmless). PC page: `node --check` on its script.
@@ -104,7 +104,7 @@ its last client leaves (the app and the PC server send `playmode` when they see 
 18. **Settings, theme, folder, About.** `settingsBtn.click()`: full-screen sheet (Camera, Saving, Location, Appearance, About). Theme System/Light/Dark changes
     `document.documentElement.dataset.theme` and the screenshot; System follows `adb shell cmd uimode night yes|no` within ~5 s (the emulator's old WebView never reports
     `prefers-color-scheme`, so the page asks native `appInfo().night`). Folder: a new name gives `folders` = [old, new] and earlier saves still count as saved; "bad/name"
-    is refused. About shows "2.0 (12)", phone, saving folder, camera model/firmware when online.
+    is refused. About shows "3.0 (13)", phone, saving folder, camera model/firmware when online.
 19. **Finding the camera.** Home Wi-Fi, camera on. `store.set("ip","10.0.0.99"); store.set("homeIp","10.0.0.99"); cam.online=false; lastDiscover=0`: it is back on
     10.0.0.220 within ~15 s and `homeIp` is rewritten. `Native.discover({timeout:1500, subnets:["10.0.0."]})` -> `{cameras, method, ms}`. A full sweep takes ~27 s on the
     emulator (NAT; its Wi-Fi is 10.0.2.x, so the page passes the last known /24), ~12 s on a real LAN. Searching repeats at most every 30 s.
@@ -117,6 +117,16 @@ its last client leaves (the app and the PC server send `playmode` when they see 
     `data/config.json` is back to 10.0.0.220. When the camera was in rec: `camera was in rec mode: sending playmode`. With no page polling `/api/status` it logs
     `idle: releasing the camera` ~30 s later.
 
+### Drivers (v3.0)
+24. **Driver matched.** `JSON.stringify({id: drv.driver.id, matched: drv.matched, by: drv.by, camInfo})` -> `panasonic-zs100`, `matched: true`,
+    `by: "modelNumber"` (from `ssdpLocate` + the device description; `capabilityModel` if SSDP gets no reply). Settings → Camera support lists
+    the driver, "Recognised by model number" and what works. `$P logs 400 | grep "Refused to send"` shows nothing.
+25. **Cautious mode.** Fake camera as in 23 with `--driver core/drivers/panasonic-zs100.json` and `FAKE_MODEL=GH5` (its description still says
+    DMC-ZS100, so test with SSDP blocked or `store.set("driverId", null)` + a fake whose `ssdpLocate` gets no reply): `drv.matched` false, the pill
+    reads "Lumix camera · battery …", no Remote button, Settings says only the gallery and saving are on; listing, dates and saving still work.
+26. **No protocol strings in the page.** `grep -nE "cam\.cgi|60606|REC_DATE|playmode|49199|192\.168\.54" core/ui/index.html` finds nothing but the
+    SSID placeholder; same for the Java sources apart from comments.
+
 ### Remote shooting
 22. **Remote screen.** Camera online, not saving: `remoteBtn` is visible. `remoteBtn.click()` (not while a listing runs): the camera goes to rec, `remote.frames` rises (on the emulator
     set up the live view as below), `$P shot`. Hold W/T (`input swipe x y x y 1500`) zooms and sends `zoomstop`; tapping the picture sends `camctrl&type=touch&value=x/y&value2=on`;
@@ -126,7 +136,7 @@ its last client leaves (the app and the PC server send `playmode` when they see 
     (`photo.jpg` = any JPEG with EXIF, e.g. pulled from the emulator; it answers recmode/playmode/capture/zoom/touch/video/startstream, serves `/DO<n>.JPG?t=<local time>` with
     X-REC_DATE_TIME and rewritten EXIF dates, supports Range, `/_stats` lists the commands it saw; `busy` instead of `ok` answers 503). Point the app at it
     (`store.set("ip","10.0.0.129"); store.set("homeIp","10.0.0.129"); cam.online=false`) and save through the real queue:
-    `Native.enqueue({items:[{url:"http://10.0.0.129/DO1.JPG?t=<now>",name:"P9990001.JPG",size:<bytes>,mime:"image/jpeg",date:Date.now()}],camIp:"10.0.0.129",appId,folder:curFolder(),parallel:1})`.
+    `Native.enqueue({items:[{url:"http://10.0.0.129/DO1.JPG?t=<now>",name:"P9990001.JPG",size:<bytes>,mime:"image/jpeg",date:Date.now()}],camIp:"10.0.0.129",driver:camAt("10.0.0.129").slice("save"),folder:curFolder(),parallel:1})`.
     Delete the test file afterwards, stop the fake before testing discovery, put `ip`/`homeIp` back to 10.0.0.220.
 
 ## Live view on the emulator

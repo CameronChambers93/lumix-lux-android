@@ -1,13 +1,14 @@
 # lumix-lux-android
 
-Capacitor 8.6 app v2.0 (`com.cameron.lumix`, Android 10+) that copies photos and videos off a Panasonic Lumix over Wi-Fi,
+Capacitor 8.6 app v3.0 (`com.cameron.lumix`, Android 10+) that copies photos and videos off a Panasonic Lumix over Wi-Fi,
 talking to the camera directly (no PC needed); works on the camera's own hotspot (`192.168.54.1`) or on home Wi-Fi. Saves
-into the gallery (default `DCIM/Lumix`). Today it supports the ZS100 only; the multi-camera redesign plan is
-`core/docs/REDESIGN.md` (read it before changing camera code).
+into the gallery (default `DCIM/Lumix`). Cameras are described by drivers (`core/drivers/`, today the ZS100 plus the cautious
+family base); the multi-camera redesign plan is `core/docs/REDESIGN.md` (read it before changing camera code).
 
-- **Shared code is in `core/`** (git submodule, repo `lumix-lux-core`): the page `core/ui/index.html`, drivers, the protocol
-  doc `core/docs/protocols/panasonic-camcgi.md`, `core/tools/fakecam.py`. `build.sh` copies the page into `www/` (gitignored
-  there). Edit the page in `core/`, commit and push in `core/`, then commit the submodule bump here.
+- **Shared code is in `core/`** (git submodule, repo `lumix-lux-core`): the page `core/ui/index.html`, the camera runtime
+  `core/js/lux-camera.js`, drivers, the protocol doc `core/docs/protocols/panasonic-camcgi.md`, `core/tools/fakecam.py`.
+  `build.sh` copies the page, `js/` and `drivers/` (plus a generated `drivers/index.json`) into `www/` (gitignored there).
+  Edit them in `core/`, commit and push in `core/`, then commit the submodule bump here.
   If `core/` is empty: `git submodule update --init`.
 - **Camera:** joins the home Wi-Fi "Via Network" (Wi-Fi → Remote Shooting & View) and is at `10.0.0.220`. It only answers
   while on that waiting screen, and serves one app at a time (others get 503 / `err_already_connected`), so stop the
@@ -15,14 +16,21 @@ into the gallery (default `DCIM/Lumix`). Today it supports the ZS100 only; the m
 
 ## App
 
-- **UI/logic:** `core/ui/index.html` (no bundler; `window.Capacitor`). Gallery grouped by day (dates from `X-REC_DATE_TIME`),
+- **UI/logic:** `core/ui/index.html` (no bundler; `window.Capacitor`). It has no protocol strings: it talks to the camera through
+  the runtime (`lux-camera.js`, transport = `Native.httpGet/httpPost`), identifies it on connect (`ssdpLocate` + capability →
+  `matchDriver`, remembered in localStorage `driverId`) and shows only what the driver's `features` allow (Remote, video, zoom,
+  touch focus, date lookups); an unknown camera runs the family base in cautious mode (gallery and saving). Settings → Camera
+  support shows the driver. Gallery grouped by day (dates from the driver's date header, `X-REC_DATE_TIME` on the ZS100),
   filters/search/sort, select (long-press, drag, day, all), pull-to-refresh, fast scroll, viewer (pinch/double-tap zoom,
   Full size, Details/EXIF, Share, Open in), Remote screen (live view, shutter, zoom, focus, video), full-screen Settings.
   Android Back arrives as a native `back` event (`handleBack`).
 - **Native** (`android/app/src/main/java/com/cameron/lumix/`): `LumixNativePlugin` (all camera HTTP pinned to the Wi-Fi network),
-  `SaveQueue` (static download engine) + `SaveService`, `LocationService` + `LocationLog`.
+  `SaveQueue` (static download engine) + `SaveService`, `LocationService` + `LocationLog`, `Guard` (the runtimes' denylist again,
+  on every camera request native code sends). Native code knows no camera: what it needs comes from the runtime's driver slices
+  (`enqueue({driver: cam.slice("save")})`, `discover({...discoverSlice(base), hotspots})`, `startLiveView(cam.slice("liveView"))`,
+  `camDates/camThumb/exifRemote({header})`).
   - Plugin methods: `httpGet/httpPost, bindWifi, listSaved, thumbs, camThumb, camDates/stopDates, exif, exifRemote, share, openExternal,
-    exitApp, enqueue/queueState/cancelSave, freeSpace, requestNotifications, appInfo, setSystemBars, discover, cameraInfo,
+    exitApp, enqueue/queueState/cancelSave, freeSpace, requestNotifications, appInfo, setSystemBars, discover, ssdpLocate,
     getCameraWifi/setCameraWifi/joinCameraWifi/leaveCameraWifi/joinState, locationStatus/setLocationRecording/clearLocationLog,
     startLiveView/stopLiveView`. Events: `queue, saved, date, back, frame, liveview, location`.
   - `SaveService` (foreground, `dataSync`): background saving with progress/Cancel notification; resume with `Range` (SharedPreferences
@@ -34,10 +42,10 @@ into the gallery (default `DCIM/Lumix`). Today it supports the ZS100 only; the m
     SharedPreferences `camwifi`), gallery folder (every folder ever used is passed to `listSaved`), downloads at once 1/2, auto-save on
     connect, record location, theme System/Light/Dark. The app finds the camera by itself (`discover()`: multicast SSDP, then a /24 sweep).
   - The camera drops back to `rec` mode by itself some seconds after its last client leaves. Everything that lists or downloads
-    sends `camcmd&value=playmode` first when `getstate` says otherwise, except while the Remote screen is open. Remote always ends
-    with `stopstream` + `playmode`.
+    switches it to the driver's media mode first (`camcmd&value=playmode` on the ZS100) when its state says otherwise, except while
+    the Remote screen is open. Remote always ends with the stream stopped and the media mode.
   - No clock-set command exists on the ZS100 (not offered); no deleting from the camera, ever.
-- **Build:** `sh build.sh` → `dist/lumix.apk`. Bump `versionCode` in `android/app/build.gradle` per release (v2.0 = code 12).
+- **Build:** `sh build.sh` → `dist/lumix.apk`. Bump `versionCode` in `android/app/build.gradle` per release (v2.0 = code 12, v3.0 = code 13).
 - **Signing key:** `keystore/` (gitignored; copy it over from the old `lumix` project's `mobile/keystore/`). Losing it means updates
   won't install over the old app (uninstall first). Toolchain (Node 22, JDK 21, SDK 36) is in the Dockerfile; Gradle cache in volume
   `dc-lumix-gradle`.

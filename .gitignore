@@ -3,8 +3,10 @@ keystore/
 android/app/build/
 android/build/
 android/.gradle/
-# Copied from core/ui by build.sh
+# Copied from core/ by build.sh
 www/index.html
+www/js/
+www/drivers/
 dist/
 tools/out/
 tools/.device

@@ -6,12 +6,14 @@ import android.graphics.BitmapFactory;
 import android.graphics.Matrix;
 import android.media.ExifInterface;
 import android.util.Size;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import android.content.ContentResolver;
@@ -76,7 +78,9 @@ public class LumixNativePlugin extends Plugin {
         return wifiNetwork(cm());
     }
 
+    /** A GET-style connection to the camera, pinned to Wi-Fi. Every URL passes the guard first (they come from drivers). */
     private HttpURLConnection open(String url, int timeout) throws IOException {
+        Guard.check(url);
         Network net = wifi();
         URL u = new URL(url);
         HttpURLConnection c = (HttpURLConnection) (net != null ? net.openConnection(u) : u.openConnection());
@@ -124,6 +128,12 @@ public class LumixNativePlugin extends Plugin {
         pool.execute(() -> {
             HttpURLConnection c = null;
             try {
+                String soap = null;
+                for (Iterator<String> it = headers.keys(); it.hasNext(); ) {
+                    String k = it.next();
+                    if (k.equalsIgnoreCase("SOAPACTION")) soap = headers.getString(k);
+                }
+                Guard.check(url, method, body, soap);
                 c = open(url, timeout);
                 c.setRequestMethod(method);
                 Iterator<String> keys = headers.keys();
@@ -143,6 +153,11 @@ public class LumixNativePlugin extends Plugin {
                 InputStream in = status >= 400 ? c.getErrorStream() : c.getInputStream();
                 JSObject r = new JSObject();
                 r.put("status", status);
+                JSObject hs = new JSObject();   // lower-case names, as the runtime's transport contract says
+                for (Map.Entry<String, List<String>> e : c.getHeaderFields().entrySet()) {
+                    if (e.getKey() != null && e.getValue() != null && !e.getValue().isEmpty()) hs.put(e.getKey().toLowerCase(java.util.Locale.ROOT), e.getValue().get(0));
+                }
+                r.put("headers", hs);
                 r.put("body", in == null ? "" : readAll(in));
                 call.resolve(r);
             } catch (Exception e) {
@@ -343,12 +358,14 @@ public class LumixNativePlugin extends Plugin {
     private volatile int datesGen = 0;
 
     /**
-     * camThumb({url, id, cacheOnly}) -> {path, date}. Caches the camera's thumbnail at cacheDir/camthumbs/<id>.jpg;
-     * "date" is the X-REC_DATE_TIME header (camera local time, no zone) or null when served from the cache.
+     * camThumb({url, id, cacheOnly, header}) -> {path, date}. Caches the camera's thumbnail at cacheDir/camthumbs/<id>.jpg;
+     * "date" is the driver's date header (camera local time, no zone; e.g. X-REC_DATE_TIME) or null when served from the
+     * cache or the driver has none.
      */
     @PluginMethod
     public void camThumb(PluginCall call) {
         String url = call.getString("url");
+        String header = call.getString("header");
         String id = call.getString("id", "");
         boolean cacheOnly = call.getBoolean("cacheOnly", false);
         pool.execute(() -> {
@@ -382,7 +399,7 @@ public class LumixNativePlugin extends Plugin {
                         if (attempt >= 2) throw e;
                     }
                 }
-                String date = c.getHeaderField("X-REC_DATE_TIME");
+                String date = header == null ? null : c.getHeaderField(header);
                 File tmp = new File(dir, f.getName() + ".tmp");
                 try (InputStream in = c.getInputStream(); FileOutputStream o = new FileOutputStream(tmp)) {
                     byte[] buf = new byte[16384];
@@ -406,13 +423,17 @@ public class LumixNativePlugin extends Plugin {
     }
 
     /**
-     * camDates({items:[{id,url}]}): one at a time, HEAD each url (Range GET if HEAD gives no date) and emit a
-     * "date" event {id, date}. A newer call or stopDates() ends the run; so do 3 failures in a row (camera gone).
+     * camDates({items:[{id,url}], header, range}): one at a time, HEAD each url (a GET of byte 0 if HEAD gives no date;
+     * a whole GET when the camera has no Range) and emit a "date" event {id, date} with the driver's date header.
+     * A newer call or stopDates() ends the run; so do 5 failures in a row (camera gone).
      */
     @PluginMethod
     public void camDates(PluginCall call) {
         JSArray arr = call.getArray("items");
+        final String header = call.getString("header");
+        final boolean range = call.getBoolean("range", true);
         final int gen = ++datesGen;
+        if (header == null) { JSObject r = new JSObject(); r.put("found", 0); call.resolve(r); return; }
         pool.execute(() -> {
             int found = 0, fails = 0;
             try {
@@ -424,8 +445,8 @@ public class LumixNativePlugin extends Plugin {
                         camSem.acquire();
                         held = true;
                         if (gen != datesGen) break;
-                        date = dateHeader(it.getString("url"), "HEAD");
-                        if (date == null) date = dateHeader(it.getString("url"), "GET");
+                        date = dateHeader(it.getString("url"), "HEAD", header, range);
+                        if (date == null) date = dateHeader(it.getString("url"), "GET", header, range);
                         fails = 0;
                     } catch (Exception e) {
                         fails++;
@@ -449,14 +470,14 @@ public class LumixNativePlugin extends Plugin {
         });
     }
 
-    private String dateHeader(String url, String method) throws IOException {
+    private String dateHeader(String url, String method, String header, boolean range) throws IOException {
         HttpURLConnection c = open(url, 4000);
         try {
             c.setRequestMethod(method);
-            if (method.equals("GET")) c.setRequestProperty("Range", "bytes=0-0");
+            if (method.equals("GET") && range) c.setRequestProperty("Range", "bytes=0-0");
             int code = c.getResponseCode();
             if (code != 200 && code != 206) return null;
-            return c.getHeaderField("X-REC_DATE_TIME");
+            return c.getHeaderField(header);
         } finally {
             c.disconnect();
         }
@@ -528,10 +549,11 @@ public class LumixNativePlugin extends Plugin {
         });
     }
 
-    /** exifRemote({url}): streams the camera's original only as far as the EXIF header, then drops the connection. */
+    /** exifRemote({url, header}): streams the camera's original only as far as the EXIF header, then drops the connection. */
     @PluginMethod
     public void exifRemote(PluginCall call) {
         String url = call.getString("url");
+        String header = call.getString("header");
         pool.execute(() -> {
             HttpURLConnection c = null;
             boolean held = false;
@@ -550,7 +572,7 @@ public class LumixNativePlugin extends Plugin {
                 }
                 try (InputStream in = c.getInputStream()) {
                     JSObject r = exifToJs(new androidx.exifinterface.media.ExifInterface(in));
-                    String rec = c.getHeaderField("X-REC_DATE_TIME");
+                    String rec = header == null ? null : c.getHeaderField(header);
                     if (rec != null && !r.has("taken")) r.put("taken", rec);
                     call.resolve(r);
                 }
@@ -664,7 +686,7 @@ public class LumixNativePlugin extends Plugin {
 
     // ---- background save queue (SaveQueue + SaveService)
 
-    /** enqueue({items:[{url,name,size,mime,date}], camIp, appId, folder, parallel}) -> queue snapshot. */
+    /** enqueue({items:[{url,name,size,mime,date}], camIp, driver, folder, parallel}) -> queue snapshot. driver: the runtime's save slice. */
     @PluginMethod
     public void enqueue(PluginCall call) {
         JSArray arr = call.getArray("items");
@@ -677,7 +699,9 @@ public class LumixNativePlugin extends Plugin {
             }
             String folder = call.getString("folder", DIR);
             if (!folder.endsWith("/")) folder += "/";
-            SaveQueue.enqueue(getContext(), jobs, call.getString("camIp"), folder, call.getInt("parallel", 1), call.getString("appId", ""));
+            JSObject d = call.getObject("driver");
+            if (d == null) throw new IllegalArgumentException("driver is required (the runtime's save slice)");
+            SaveQueue.enqueue(getContext(), jobs, call.getString("camIp"), folder, call.getInt("parallel", 1), new SaveQueue.Driver(d));
             try {
                 androidx.core.content.ContextCompat.startForegroundService(getContext(), new android.content.Intent(getContext(), SaveService.class));
             } catch (Exception e) {   // e.g. not allowed to start from the background
@@ -770,14 +794,43 @@ public class LumixNativePlugin extends Plugin {
         call.resolve();
     }
 
-    private static final String SSDP_SEARCH = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\n"
-        + "ST: urn:schemas-upnp-org:device:MediaServer:1\r\n\r\n";
+    /** What discover() looks for, from the runtime's discover slice (the family base driver). */
+    static final class Probe {
+        final String request, path, query, match;
+        final int ssdpPort, port, busyStatus, busyPort;
+        final List<String> replyContains = new ArrayList<>();
 
-    /** "ok" for a camera answering getstate, "busy" for a 503 from a host that also accepts on :60606, else null. */
-    private static String probeCamera(Network net, String host, int timeout) {
+        Probe(PluginCall call) throws Exception {
+            JSObject ssdp = call.getObject("ssdp"), p = call.getObject("probe");
+            if (ssdp == null || p == null) throw new IllegalArgumentException("ssdp and probe are required (the runtime's discover slice)");
+            request = ssdp.getString("request");
+            ssdpPort = ssdp.getInt("port");
+            JSONArray rc = ssdp.getJSONArray("replyContains");
+            for (int i = 0; i < rc.length(); i++) replyContains.add(rc.getString(i).toLowerCase(java.util.Locale.ROOT));
+            port = p.getInt("port");
+            path = p.getString("path");
+            query = p.getString("query");
+            match = p.getString("match");
+            busyStatus = p.getInt("busyStatus");
+            busyPort = p.getInt("busyPort");
+        }
+
+        String url(String host) { return "http://" + host + (port == 80 ? "" : ":" + port) + path + "?" + query; }
+
+        boolean looksLikeCamera(String ssdpReply) {
+            String t = ssdpReply.toLowerCase(java.util.Locale.ROOT);
+            for (String s : replyContains) if (t.contains(s)) return true;
+            return false;
+        }
+    }
+
+    /** "ok" for a camera answering the probe, "busy" for a busy answer from a host that also accepts on the busy port, else null. */
+    private static String probeCamera(Network net, String host, int timeout, Probe pr) {
         HttpURLConnection c = null;
         try {
-            URL u = new URL("http://" + host + "/cam.cgi?mode=getstate");
+            String url = pr.url(host);
+            Guard.check(url);
+            URL u = new URL(url);
             c = (HttpURLConnection) (net != null ? net.openConnection(u) : u.openConnection());
             c.setConnectTimeout(timeout);
             c.setReadTimeout(timeout);
@@ -788,17 +841,17 @@ public class LumixNativePlugin extends Plugin {
                 try (InputStream in = c.getInputStream()) {
                     byte[] b = new byte[2048];
                     int n = in.read(b);
-                    return n > 0 && new String(b, 0, n, StandardCharsets.UTF_8).contains("<camrply") ? "ok" : null;
+                    return n > 0 && new String(b, 0, n, StandardCharsets.UTF_8).contains(pr.match) ? "ok" : null;
                 }
             }
-            if (code != 503) return null;
+            if (code != pr.busyStatus) return null;
         } catch (Exception e) {
             return null;
         } finally {
             if (c != null) c.disconnect();
         }
         try (java.net.Socket s = net != null ? net.getSocketFactory().createSocket() : new java.net.Socket()) {
-            s.connect(new java.net.InetSocketAddress(host, 60606), timeout);
+            s.connect(new java.net.InetSocketAddress(host, pr.busyPort), timeout);
             return "busy";
         } catch (Exception e) {
             return null;
@@ -807,17 +860,14 @@ public class LumixNativePlugin extends Plugin {
 
     private static final java.util.regex.Pattern SSDP_LOC = java.util.regex.Pattern.compile("^LOCATION:\\s*http://([\\d.]+):(\\d+)(\\S*)", java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.MULTILINE);
 
-    /** Reads SSDP replies until `until`; adds the IPs of Panasonic-looking ones (LOCATION port 60606 or SERVER Panasonic). */
-    private static void collectSsdp(java.net.DatagramSocket sock, long until, java.util.Set<String> out) {
+    /** Reads SSDP replies until `until`; adds the IPs of ones that look like a camera of the family (replyContains). */
+    private static void collectSsdp(java.net.DatagramSocket sock, long until, java.util.Set<String> out, Probe pr) {
         byte[] buf = new byte[2048];
         while (System.currentTimeMillis() < until) {
             try {
                 java.net.DatagramPacket p = new java.net.DatagramPacket(buf, buf.length);
                 sock.receive(p);
-                String t = new String(p.getData(), 0, p.getLength(), StandardCharsets.UTF_8);
-                java.util.regex.Matcher m = SSDP_LOC.matcher(t);
-                boolean cam = t.toLowerCase(java.util.Locale.ROOT).contains("panasonic") || (m.find() && "60606".equals(m.group(2)));
-                if (cam) out.add(p.getAddress().getHostAddress());
+                if (pr.looksLikeCamera(new String(p.getData(), 0, p.getLength(), StandardCharsets.UTF_8))) out.add(p.getAddress().getHostAddress());
             } catch (java.net.SocketTimeoutException e) {
                 // keep waiting until the deadline
             } catch (Exception e) {
@@ -829,21 +879,28 @@ public class LumixNativePlugin extends Plugin {
     private static JSObject camEntry(String ip, String state) {
         JSObject o = new JSObject();
         o.put("ip", ip);
-        o.put("name", "Lumix camera");
         o.put("state", state);
         return o;
     }
 
+    private static String prefix24(String ip) {
+        return ip == null || ip.lastIndexOf('.') < 0 ? null : ip.substring(0, ip.lastIndexOf('.') + 1);
+    }
+
     /**
-     * discover({timeout, subnets}) -> {cameras:[{ip,name,state}], method, hotspot, ms}. Multicast SSDP first (up to
-     * `timeout` ms); with no usable reply a sweep of the Wi-Fi /24 (plus any extra "subnets", e.g. "10.0.0.") with
-     * getstate on port 80 (1.5 s, 32 at a time, stops at the first camera), with a unicast M-SEARCH sent to each
-     * host as well. On the camera's hotspot (192.168.54.x) there is nothing to search.
+     * discover({timeout, subnets, ssdp, probe, hotspots}) -> {cameras:[{ip,state}], method, hotspot, hotspotIp, ms}.
+     * ssdp/probe are the runtime's discover slice; hotspots lists the addresses cameras have on their own Wi-Fi.
+     * Multicast SSDP first (up to `timeout` ms); with no usable reply a sweep of the Wi-Fi /24 (plus any extra "subnets",
+     * e.g. "10.0.0.") with the probe (1.5 s, 32 at a time, stops at the first camera), with a unicast M-SEARCH sent to
+     * each host as well. On a camera's hotspot (same /24 as one of `hotspots`) there is nothing to search.
      */
     @PluginMethod
     public void discover(PluginCall call) {
         int timeout = Math.max(500, Math.min(call.getInt("timeout", 3000), 10000));
         JSArray extra = call.getArray("subnets");
+        JSArray hotspots = call.getArray("hotspots");
+        final Probe pr;
+        try { pr = new Probe(call); } catch (Exception e) { call.reject(e.toString()); return; }
         pool.execute(() -> {
             long t0 = System.currentTimeMillis();
             JSObject r = new JSObject();
@@ -868,13 +925,17 @@ public class LumixNativePlugin extends Plugin {
                         if (la.getAddress() instanceof java.net.Inet4Address) own = la.getAddress().getHostAddress();
                     }
                 }
-                if (own != null && own.startsWith("192.168.54.")) {
-                    r.put("hotspot", true);
-                    r.put("method", "hotspot");
-                    r.put("cameras", cams);
-                    r.put("ms", System.currentTimeMillis() - t0);
-                    call.resolve(r);
-                    return;
+                for (int i = 0; own != null && hotspots != null && i < hotspots.length(); i++) {
+                    String h = hotspots.getString(i);
+                    if (h != null && own.startsWith(prefix24(h))) {
+                        r.put("hotspot", true);
+                        r.put("hotspotIp", h);
+                        r.put("method", "hotspot");
+                        r.put("cameras", cams);
+                        r.put("ms", System.currentTimeMillis() - t0);
+                        call.resolve(r);
+                        return;
+                    }
                 }
                 java.util.Set<String> bases = new java.util.LinkedHashSet<>();
                 for (int i = 0; extra != null && i < extra.length(); i++) {
@@ -882,7 +943,7 @@ public class LumixNativePlugin extends Plugin {
                     if (b != null && b.matches("\\d+\\.\\d+\\.\\d+\\.(0)?")) bases.add(b.substring(0, b.lastIndexOf('.') + 1));
                 }
                 // The /24 the camera was last seen in (usually the Wi-Fi's own) is swept first, then the Wi-Fi's.
-                if (own != null) bases.add(own.substring(0, own.lastIndexOf('.') + 1));
+                if (own != null) bases.add(prefix24(own));
                 // 1. multicast SSDP
                 android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager) getContext().getApplicationContext().getSystemService(Context.WIFI_SERVICE);
                 if (wm != null) {
@@ -897,17 +958,17 @@ public class LumixNativePlugin extends Plugin {
                 sock = new java.net.DatagramSocket();
                 sock.setSoTimeout(250);
                 try { net.bindSocket(sock); } catch (Exception ignored) { }
-                byte[] msg = SSDP_SEARCH.getBytes(StandardCharsets.UTF_8);
+                byte[] msg = pr.request.getBytes(StandardCharsets.UTF_8);
                 for (int k = 0; k < 2; k++) {
                     try {
                         sock.send(new java.net.DatagramPacket(msg, msg.length, java.net.InetAddress.getByName("239.255.255.250"), 1900));
                     } catch (Exception ignored) { }
                 }
                 java.util.Set<String> ssdp = new java.util.LinkedHashSet<>();
-                collectSsdp(sock, System.currentTimeMillis() + timeout, ssdp);
+                collectSsdp(sock, System.currentTimeMillis() + timeout, ssdp, pr);
                 String method = "none";
                 for (String ip : ssdp) {
-                    String st = probeCamera(net, ip, 1500);
+                    String st = probeCamera(net, ip, 1500, pr);
                     if (st != null) {
                         cams.put(camEntry(ip, st));
                         method = "ssdp";
@@ -924,13 +985,13 @@ public class LumixNativePlugin extends Plugin {
                     }
                     for (String h : hosts) {   // unicast M-SEARCH to every host: replies are collected after the sweep
                         try {
-                            sock.send(new java.net.DatagramPacket(msg, msg.length, java.net.InetAddress.getByName(h), 1900));
+                            sock.send(new java.net.DatagramPacket(msg, msg.length, java.net.InetAddress.getByName(h), pr.ssdpPort));
                         } catch (Exception ignored) { }
                     }
                     ExecutorService ex = Executors.newFixedThreadPool(32);
                     java.util.concurrent.CompletionService<String[]> cs = new java.util.concurrent.ExecutorCompletionService<>(ex);
                     try {
-                        for (String h : hosts) cs.submit(() -> new String[]{h, probeCamera(net, h, 1500)});
+                        for (String h : hosts) cs.submit(() -> new String[]{h, probeCamera(net, h, 1500, pr)});
                         long deadline = System.currentTimeMillis() + 45000;
                         for (int i = 0; i < hosts.size() && System.currentTimeMillis() < deadline; i++) {
                             Future<String[]> f = cs.poll(Math.max(1, deadline - System.currentTimeMillis()), java.util.concurrent.TimeUnit.MILLISECONDS);
@@ -945,11 +1006,11 @@ public class LumixNativePlugin extends Plugin {
                     } finally {
                         ex.shutdownNow();
                     }
-                    if (cams.length() == 0) {   // M-SEARCH replies from hosts whose web server isn't on port 80
+                    if (cams.length() == 0) {   // M-SEARCH replies from hosts whose web server isn't where the probe looks
                         java.util.Set<String> late = new java.util.LinkedHashSet<>();
-                        collectSsdp(sock, System.currentTimeMillis() + 500, late);
+                        collectSsdp(sock, System.currentTimeMillis() + 500, late, pr);
                         for (String ip : late) {
-                            String st = probeCamera(net, ip, 1500);
+                            String st = probeCamera(net, ip, 1500, pr);
                             if (st != null) {
                                 cams.put(camEntry(ip, st));
                                 method = "ssdp-unicast";
@@ -970,10 +1031,15 @@ public class LumixNativePlugin extends Plugin {
         });
     }
 
-    /** cameraInfo({ip}) -> {name, model, firmware}: unicast SSDP to the camera, then its device description. Empty when it can't be read. */
+    /**
+     * ssdpLocate({ip, port, request, timeout=2000}) -> {location}: sends the M-SEARCH `request` (from the runtime) to one
+     * host and returns the LOCATION of its first reply (its device description; the runtime reads it), or no location.
+     */
     @PluginMethod
-    public void cameraInfo(PluginCall call) {
-        String ip = call.getString("ip");
+    public void ssdpLocate(PluginCall call) {
+        String ip = call.getString("ip"), request = call.getString("request");
+        int port = call.getInt("port", 1900), timeout = Math.max(200, Math.min(call.getInt("timeout", 2000), 10000));
+        if (ip == null || request == null) { call.reject("ip and request are required"); return; }
         pool.execute(() -> {
             JSObject r = new JSObject();
             java.net.DatagramSocket sock = null;
@@ -982,29 +1048,17 @@ public class LumixNativePlugin extends Plugin {
                 sock = new java.net.DatagramSocket();
                 sock.setSoTimeout(400);
                 if (net != null) net.bindSocket(sock);
-                byte[] msg = SSDP_SEARCH.getBytes(StandardCharsets.UTF_8);
-                sock.send(new java.net.DatagramPacket(msg, msg.length, java.net.InetAddress.getByName(ip), 1900));
-                String loc = null;
+                byte[] msg = request.getBytes(StandardCharsets.UTF_8);
+                sock.send(new java.net.DatagramPacket(msg, msg.length, java.net.InetAddress.getByName(ip), port));
                 byte[] buf = new byte[2048];
-                long until = System.currentTimeMillis() + 2000;
-                while (loc == null && System.currentTimeMillis() < until) {
+                long until = System.currentTimeMillis() + timeout;
+                while (!r.has("location") && System.currentTimeMillis() < until) {
                     try {
                         java.net.DatagramPacket p = new java.net.DatagramPacket(buf, buf.length);
                         sock.receive(p);
                         java.util.regex.Matcher m = SSDP_LOC.matcher(new String(p.getData(), 0, p.getLength(), StandardCharsets.UTF_8));
-                        if (m.find()) loc = "http://" + ip + ":" + m.group(2) + m.group(3);
+                        if (m.find()) r.put("location", "http://" + ip + ":" + m.group(2) + m.group(3));
                     } catch (java.net.SocketTimeoutException ignored) { }
-                }
-                if (loc != null) {
-                    HttpURLConnection c = open(loc, 4000);
-                    try (InputStream in = c.getInputStream()) {
-                        String x = readAll(in);
-                        put(r, "name", xmlTag(x, "friendlyName"));
-                        put(r, "model", xmlTag(x, "modelNumber"));
-                        put(r, "firmware", xmlTag(x, "X_FirmVersion"));
-                    } finally {
-                        c.disconnect();
-                    }
                 }
             } catch (Exception e) {
                 r.put("error", e.toString());
@@ -1013,11 +1067,6 @@ public class LumixNativePlugin extends Plugin {
             }
             call.resolve(r);
         });
-    }
-
-    private static String xmlTag(String xml, String name) {
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("<(?:\\w+:)?" + name + ">([^<]*)<").matcher(xml);
-        return m.find() && !m.group(1).trim().isEmpty() ? m.group(1).trim() : null;
     }
 
     // Joining the camera's own Wi-Fi (WifiNetworkSpecifier). The name and password live in SharedPreferences.
@@ -1226,7 +1275,7 @@ public class LumixNativePlugin extends Plugin {
         });
     }
 
-    // ---- live view: the camera sends JPEG frames by UDP to the port given in startstream
+    // ---- live view: the camera sends JPEG frames by UDP to the port its start request names (the driver's liveView slice)
 
     private final Object liveLock = new Object();
     private volatile Thread liveThread;
@@ -1240,7 +1289,7 @@ public class LumixNativePlugin extends Plugin {
         if (t != null) t.interrupt();
     }
 
-    /** Offset of the JPEG (FF D8 FF) inside a datagram, or -1. The camera puts a short header in front of it. */
+    /** Offset of the JPEG (FF D8 FF) inside a datagram, or -1. The camera puts a short header in front of it (jpegScan). */
     static int jpegStart(byte[] b, int len) {
         int max = Math.min(len - 3, 512);
         for (int i = 0; i < max; i++) {
@@ -1249,9 +1298,9 @@ public class LumixNativePlugin extends Plugin {
         return -1;
     }
 
-    private void sendStartStream(String ip, int port) {
+    private void sendStartStream(String url) {
         try {
-            HttpURLConnection c = open("http://" + ip + "/cam.cgi?mode=startstream&value=" + port, 3000);
+            HttpURLConnection c = open(url, 3000);
             try { c.getResponseCode(); readAll(c.getInputStream()); } finally { c.disconnect(); }
         } catch (Exception e) {
             android.util.Log.w("LumixLive", "startstream: " + e);
@@ -1259,15 +1308,19 @@ public class LumixNativePlugin extends Plugin {
     }
 
     /**
-     * startLiveView({camIp, port=49199}): opens a UDP socket on the Wi-Fi network, sends startstream, and emits the newest
-     * frame as a base64 JPEG in "frame" events ({data, n}) at most 15 times a second. Re-sends startstream when frames stop.
+     * startLiveView({port, startUrl, jpegScan, started}) (the runtime's liveView slice): opens a UDP socket on the Wi-Fi
+     * network, requests the stream (unless "started": the page just did), and emits the newest frame as a base64 JPEG in
+     * "frame" events ({data, n}) at most 15 times a second. Requests the stream again when frames stop.
      * Emits "liveview" {state: "frames"|"stalled"} on changes. Resolves once the socket is open.
      */
     @PluginMethod
     public void startLiveView(PluginCall call) {
-        final String ip = call.getString("camIp");
-        final int port = call.getInt("port", 49199);
-        if (ip == null) { call.reject("camIp is required"); return; }
+        final String startUrl = call.getString("startUrl");
+        final Integer port = call.getInt("port");
+        final boolean scan = call.getBoolean("jpegScan", true);
+        final boolean started = call.getBoolean("started", false);
+        if (startUrl == null || port == null) { call.reject("port and startUrl are required"); return; }
+        try { Guard.check(startUrl); } catch (IOException e) { call.reject(e.getMessage()); return; }
         stopLive();
         final java.net.DatagramSocket sock;
         try {
@@ -1284,19 +1337,19 @@ public class LumixNativePlugin extends Plugin {
         Thread t = new Thread(() -> {
             byte[] buf = new byte[65535];
             java.net.DatagramPacket pk = new java.net.DatagramPacket(buf, buf.length);
-            long lastFrame = 0, lastEmit = 0, lastStart = 0, frames = 0;
+            long lastFrame = 0, lastEmit = 0, lastStart = started ? android.os.SystemClock.uptimeMillis() : 0, frames = 0;
             boolean stalled = true;
             byte[] pending = null;
             while (liveSock == sock && !Thread.currentThread().isInterrupted()) {
                 long now = android.os.SystemClock.uptimeMillis();
                 if (lastStart == 0 || now - Math.max(lastFrame, lastStart) > 5000) {   // never started, or frames stopped
-                    sendStartStream(ip, port);
+                    sendStartStream(startUrl);
                     lastStart = android.os.SystemClock.uptimeMillis();
                 }
                 try {
                     pk.setLength(buf.length);
                     sock.receive(pk);
-                    int off = jpegStart(buf, pk.getLength());
+                    int off = scan ? jpegStart(buf, pk.getLength()) : 0;
                     if (off >= 0) {
                         pending = java.util.Arrays.copyOfRange(buf, off, pk.getLength());
                         lastFrame = android.os.SystemClock.uptimeMillis();
